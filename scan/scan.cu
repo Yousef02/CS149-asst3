@@ -27,6 +27,24 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+// Cuda kernel for the upsweep phase of the scan
+__global__ void upsweep(int* result, int N, int two_d, int two_dplus1) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N + 1) {
+        result[index+two_dplus1-1] += result[index+two_d-1];
+    }
+}
+
+// Cuda kernel for the downsweep phase of the scan
+__global__ void downsweep(int* result, int N, int two_d, int two_dplus1) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N + 1) {
+        int t = result[index+two_d-1];
+        result[index+two_d-1] = result[index+two_dplus1-1];
+        result[index+two_dplus1-1] += t;
+    }
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -54,7 +72,50 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    // here is the c like implementation of the scan"
+    // void exclusive_scan_iterative(int* start, int* end, int* output) {
 
+    //     int N = end - start;
+    //     memmove(output, start, N*sizeof(int));
+    
+    //     // upsweep phase
+    //     for (int two_d = 1; two_d <= N/2; two_d*=2) {
+    //         int two_dplus1 = 2*two_d;
+    //         parallel_for (int i = 0; i < N; i += two_dplus1) {
+    //             output[i+two_dplus1-1] += output[i+two_d-1];
+    //         }
+    //     }
+    
+    //     output[N-1] = 0;
+    
+    //     // downsweep phase
+    //     for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+    //         int two_dplus1 = 2*two_d;
+    //         parallel_for (int i = 0; i < N; i += two_dplus1) {
+    //             int t = output[i+two_d-1];
+    //             output[i+two_d-1] = output[i+two_dplus1-1];
+    //             output[i+two_dplus1-1] += t;
+    //         }
+    //     }
+    // }
+
+    int block_size = THREADS_PER_BLOCK;
+    int num_blocks = (N + block_size - 1) / block_size;
+
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        upsweep<<<num_blocks, block_size>>>(result, N, two_d, two_dplus1);
+    }
+    cudaDeviceSynchronize();
+
+    result[N-1] = 0;
+
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        downsweep<<<num_blocks, block_size>>>(result, N, two_d, two_dplus1);
+    }
+
+    cudaDeviceSynchronize();
 }
 
 
