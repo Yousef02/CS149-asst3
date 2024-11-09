@@ -16,6 +16,10 @@
 
 #include "circleBoxTest.cu_inl"
 
+#define BLOCKSIZE 256
+#define SCAN_BLOCK_DIM  BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -57,6 +61,26 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+
+
+//############################################################################
+// CUDA kernel helpers we are adding
+//############################################################################
+__global__ void construct_adj_flags(int* device_input, int length, int* flags_output) {
+    long tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= length - 1) return;
+    if (device_input[tid] == device_input[tid + 1])
+        flags_output[tid] = 1;
+}
+
+__global__ void map_flags(int* flags_input, int* indices_input, int length, int* device_output) {
+    long tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= length - 1) return;
+    if (flags_input[tid] == 0) return;
+    device_output[indices_input[tid]] = tid;
+}
+
+
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -387,12 +411,73 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    // int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    // int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // check if pixel out of bounds (width/height)
+    // instead of one pixel per thread, we will have each block handle
+    // a region of the image. then create an array of bools (or ints) to
+    // keep track of what circles affect that region. we can use the 
+    // circleBoxTest to determine if a circle affects a region. then we
+    // can do a prefix sum on the mask array to determine the indecies 
+    // of the circles that affect the region. then we can have each thread
+    // in the block render a circle.
+
+    // get the region of the image that this block will handle
+    int regionX = blockIdx.x * blockDim.x;
+    int regionY = blockIdx.y * blockDim.y;
+
+    // get the region of the image that this block will handle
+    int regionWidth = blockDim.x;
+    int regionHeight = blockDim.y;
+
+    // get the region of the image that this block will handle
+    int pixelX = regionX + threadIdx.x;
+    int pixelY = regionY + threadIdx.y;
+
+        // check if pixel out of bounds (width/height)
     if ((pixelX >= cuConstRendererParams.imageWidth) || (pixelY >= cuConstRendererParams.imageHeight))
         return;
+
+
+
+    // create a mask for the circles that affect the region
+    extern __shared__ uint sharedMem[];
+    uint* circleMask = sharedMem;
+    uint* circleMaskOutput = &sharedMem[cuConstRendererParams.numCircles];
+    uint* circleMaskScratch = &sharedMem[2 * cuConstRendererParams.numCircles];
+
+
+    int totalThreads = blockDim.x * blockDim.y;
+    int threadId = threadIdx.x + blockDim.x * threadIdx.y;
+
+    for (int i = threadId; i < cuConstRendererParams.numCircles; i += totalThreads) {
+        int index3 = 3 * i;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[i];
+
+        // check if circle affects region
+
+        // here is the function def __device__ __inline__ int
+        // circleInBox(
+        //     float circleX, float circleY, float circleRadius,
+        //     float boxL, float boxR, float boxT, float boxB)
+        
+        circleMask[threadId] = circleInBox(p.x, p.y, rad, regionX, regionX + regionWidth, regionY, regionY + regionHeight) ? 1 : 0;
+    }
+
+    
+    __syncthreads();
+
+    // exclusive scan the circleMask
+    sharedMemExclusiveScan(threadId, circleMask, circleMaskOutput, circleMaskScratch, cuConstRendererParams.numCircles);
+    __syncthreads();
+
+
+
+
+  
+
+
 
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
@@ -401,22 +486,22 @@ __global__ void kernelRenderCircles() {
     int pIndex = (pixelY * imageWidth) + pixelX;
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pIndex]);
 
-    // compute the bounding box of the circle. The bound is in integer
-    // DONT DELETE, CA Michael said we'll need for optimizations
-    // screen coordinates, so it's clamped to the edges of the screen.
-    // short imageWidth = cuConstRendererParams.imageWidth;
-    // short imageHeight = cuConstRendererParams.imageHeight;
-    // short minX = static_cast<short>(imageWidth * (p.x - rad));
-    // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    // short minY = static_cast<short>(imageHeight * (p.y - rad));
-    // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+    // // compute the bounding box of the circle. The bound is in integer
+    // // DONT DELETE, CA Michael said we'll need for optimizations
+    // // screen coordinates, so it's clamped to the edges of the screen.
+    // // short imageWidth = cuConstRendererParams.imageWidth;
+    // // short imageHeight = cuConstRendererParams.imageHeight;
+    // // short minX = static_cast<short>(imageWidth * (p.x - rad));
+    // // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    // // short minY = static_cast<short>(imageHeight * (p.y - rad));
+    // // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    // DONT DELETE, CA Michael said we'll need for optimizations
-    // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    // // a bunch of clamps.  Is there a CUDA built-in for this?
+    // // DONT DELETE, CA Michael said we'll need for optimizations
+    // // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    // // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    // // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    // // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
@@ -431,6 +516,8 @@ __global__ void kernelRenderCircles() {
         shadePixel(i, pixelCenterNorm, p, imgPtr);
     }
 }
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -650,7 +737,10 @@ CudaRenderer::render() {
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    
+    
+    uint sharedMemSize = 4 * SCAN_BLOCK_DIM * sizeof(uint);
+    kernelRenderCircles<<<gridDim, blockDim, sharedMemSize>>>();
+        
     cudaDeviceSynchronize();
 }
