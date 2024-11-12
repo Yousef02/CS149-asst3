@@ -418,7 +418,7 @@ __global__ void kernelRenderCircles() {
     uint* circleMask = sharedMem;
     uint* circleMaskOutput = &sharedMem[SCAN_BLOCK_DIM];
     uint* circleMaskScratch = &sharedMem[2 * SCAN_BLOCK_DIM];
-    uint* circleFinalId = &sharedMem[3 * SCAN_BLOCK_DIM];
+    uint* circleFinalId = &sharedMem[4 * SCAN_BLOCK_DIM];
 
     int threadId = threadIdx.y * blockDim.x + threadIdx.x;
     int totalThreads = blockDim.x * blockDim.y;
@@ -430,27 +430,32 @@ __global__ void kernelRenderCircles() {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
-    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
+    if (pixelX >= cuConstRendererParams.imageWidth ||
+         pixelY >= cuConstRendererParams.imageHeight)
         return;
 
     int numCircles = cuConstRendererParams.numCircles;
     int numChunks = (numCircles + SCAN_BLOCK_DIM - 1) / SCAN_BLOCK_DIM;
 
     // Iterate over chunks of circles
+    int pIndex = (pixelY * cuConstRendererParams.imageWidth) + pixelX;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pIndex]);
+    // use accumulator instead of direct write to global memory when 
+    // shading the pixel
+    float4 accumulator = *imgPtr;
     for (int chunk = 0; chunk < numChunks; chunk++) {
         int circleStartIndex = chunk * SCAN_BLOCK_DIM;
-
+        // each thread will process a circle
+        int circleIndex = circleStartIndex + threadId;
         // Initialize the circleMask for this chunk
         if (threadId < SCAN_BLOCK_DIM) {
             circleMask[threadId] = 0;
         }
         __syncthreads();
 
-        int circleIndex = circleStartIndex + threadId;
         if (threadId < SCAN_BLOCK_DIM && circleIndex < numCircles) {
             float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
             float rad = cuConstRendererParams.radius[circleIndex];
@@ -464,11 +469,9 @@ __global__ void kernelRenderCircles() {
             }
         }
 
-        // __syncthreads();
-
         // Perform exclusive scan on the circleMask
-        sharedMemExclusiveScan(threadId, circleMask, circleMaskOutput, circleMaskScratch, SCAN_BLOCK_DIM);
-        // __syncthreads();
+        sharedMemExclusiveScan(threadId, circleMask, circleMaskOutput, 
+                                            circleMaskScratch, SCAN_BLOCK_DIM);
 
         // Populate circleFinalId with indices of circles that affect this region
         if (circleIndex < numCircles && circleMask[threadId] == 1) {
@@ -476,23 +479,24 @@ __global__ void kernelRenderCircles() {
         }
         __syncthreads();
 
-        // Process and shade pixels for the circles that affect this region
-        if (pixelX < cuConstRendererParams.imageWidth && pixelY < cuConstRendererParams.imageHeight) {
-            int pIndex = (pixelY * cuConstRendererParams.imageWidth) + pixelX;
-            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pIndex]);
+        
+        if (pixelX < cuConstRendererParams.imageWidth &&
+             pixelY < cuConstRendererParams.imageHeight) {
             float2 pixelCenterNorm = make_float2(
                 invWidth * (static_cast<float>(pixelX) + 0.5f),
                 invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-            int numCirclesToProcess = circleMaskOutput[SCAN_BLOCK_DIM - 1] + circleMask[SCAN_BLOCK_DIM - 1];
+            int numCirclesToProcess = circleMaskOutput[SCAN_BLOCK_DIM - 1] + 
+                                                circleMask[SCAN_BLOCK_DIM - 1];
+
             for (int i = 0; i < numCirclesToProcess; i++) {
                 int circleIdx = circleFinalId[i];
                 float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
-                shadePixel(circleIdx, pixelCenterNorm, p, imgPtr);
+                shadePixel(circleIdx, pixelCenterNorm, p, &accumulator);
             }
         }
-        __syncthreads();
     }
+    *imgPtr = accumulator;
 }
 
 
@@ -707,7 +711,9 @@ void
 CudaRenderer::render() {
 
     // blockDim == num of threads per block
-    // a single block is 16 x 16 = 256 threads
+    // a single block is responsible for rendering a region of the image
+    // we are using 32x32 blocks because the max that exclusive scan can 
+    // handle is 1024
     dim3 blockDim(32, 32, 1);
 
     // gridDim == num of blocks
@@ -715,8 +721,7 @@ CudaRenderer::render() {
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
-    
-    
+
     uint sharedMemSize = 5 * SCAN_BLOCK_DIM * sizeof(uint);
     kernelRenderCircles<<<gridDim, blockDim, sharedMemSize>>>();
         
